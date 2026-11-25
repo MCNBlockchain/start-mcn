@@ -15,6 +15,7 @@ import sys
 import time
 from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -27,6 +28,7 @@ PREPARATION = DATA / "bootstrap.json"
 PREPARATION_LOCK = DATA / ".prepare.lock"
 LOCAL_RPC = "http://127.0.0.1:8545"
 LOCAL_BEACON = "http://127.0.0.1:3500"
+CHECKPOINT_URL = os.environ.get("MCN_CHECKPOINT_URL", "https://rpc.mcnblockchain.com").strip()
 IDENTITY = json.loads((ROOT / "network/identity.json").read_text())
 
 
@@ -135,6 +137,8 @@ def geth_options():
     options = [
         GETH, f"--datadir={EXECUTION}", "--state.scheme=path", "--cache=512",
         f"--networkid={IDENTITY['chain_id']}", "--syncmode=full",
+        "--miner.gaslimit=60000000", "--miner.gasprice=1000000000",
+        "--txpool.pricelimit=1000000000",
         f"--config={ROOT / 'execution/peers.toml'}", f"--bootnodes={bootnodes}",
         "--port=30303", "--discovery.v4=true", "--engine.maxreorgdepth=32",
         "--http", "--http.addr=127.0.0.1", "--http.port=8545", "--http.api=eth,net,web3",
@@ -159,6 +163,14 @@ def beacon_options():
         "--p2p-tcp-port=13000", "--p2p-udp-port=12000", "--p2p-quic-port=13000",
         "--min-sync-peers=2", "--sync-from=head", "--accept-terms-of-use",
     ]
+    checkpoint = CHECKPOINT_URL
+    if checkpoint:
+        parsed = urlsplit(checkpoint)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in {"", "/"}):
+            raise ValueError("MCN_CHECKPOINT_URL must be a Beacon API base URL without a path or credentials")
+        options.append(f"--checkpoint-sync-url={checkpoint.rstrip('/')}")
     options += [f"--peer={peer}" for peer in peers["multiaddrs"]]
     options += [f"--bootstrap-node={peer}" for peer in peers["enrs"]]
     if public_ip := os.environ.get("MCN_PUBLIC_IP"):
@@ -173,6 +185,9 @@ def run_client(options, *, beacon=False):
     check_local_data()
     if beacon:
         verify_version(PRYSM, "--version", IDENTITY["clients"]["prysm"])
+        checkpoint = CHECKPOINT_URL
+        if checkpoint and not (BEACON / "beaconchaindata/beaconchain.db").is_file():
+            verify_checkpoint_source(checkpoint.rstrip("/"))
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -192,6 +207,26 @@ def read_json(url, payload=None):
     req = Request(url, data, {"Content-Type": "application/json", "User-Agent": "mcn-network/1.0"})
     with urlopen(req, timeout=10) as response:
         return json.load(response)
+
+
+def verify_checkpoint_source(url):
+    genesis = read_json(url + "/eth/v1/beacon/genesis")["data"]
+    if (
+        int(genesis["genesis_time"]) != IDENTITY["genesis_time"]
+        or genesis["genesis_validators_root"].lower() != IDENTITY["genesis_validators_root"]
+        or genesis["genesis_fork_version"].lower() != IDENTITY["genesis_fork_version"]
+    ):
+        raise ValueError("Checkpoint source belongs to another consensus network")
+    sync = read_json(url + "/eth/v1/node/syncing")["data"]
+    if sync["is_syncing"] or sync["is_optimistic"] or sync.get("el_offline", False):
+        raise ValueError("Checkpoint source is not ready")
+    checkpoints = read_json(url + "/eth/v1/beacon/states/head/finality_checkpoints")
+    finalized = checkpoints["data"]["finalized"]
+    if (checkpoints.get("execution_optimistic", False)
+            or int(finalized["epoch"]) <= 0
+            or not re.fullmatch(r"0x[0-9a-fA-F]{64}", finalized["root"])
+            or int(finalized["root"], 16) == 0):
+        raise ValueError("Checkpoint source has no usable finalized checkpoint")
 
 
 def rpc(url, method, *params, allow_missing_finalized=False):
