@@ -1,0 +1,1 @@
+ethstaker_deposit @ https://codeload.github.com/ethstaker/ethstaker-deposit-cli/tar.gz/refs/tags/v1.3.0#sha256=0b8038d928ed4d19e8181ab0c4a66f90f04c185cab236f7e39fbdda9d7f3cee3

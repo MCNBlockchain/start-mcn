@@ -1,0 +1,12 @@
+{
+  "chain_id": 2325,
+  "execution_genesis_hash": "0xaed6cbc96425678993f2beedef93ab9f8dabab801da7858ac54b8f35f3e5909e",
+  "genesis_time": 1794088445,
+  "genesis_validators_root": "0x6d7b05bfda475be67119697fe38000be692cbff0cbd78890eae8d40823e0cf91",
+  "genesis_fork_version": "0x23251200",
+  "reference_rpc": "https://rpc.mcnblockchain.com",
+  "clients": {
+    "geth": "1.17.10",
+    "prysm": "7.3.1"
+  }
+}

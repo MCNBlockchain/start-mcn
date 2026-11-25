@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+python="$root/.tools/deposit/bin/python"
+if [ ! -x "$python" ]; then
+    echo "Сначала выполните ./setup-deposit." >&2
+    exit 1
+fi
+exec "$python" "$root/tools/deposit.py" create "$@"

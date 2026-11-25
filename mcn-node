@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+from ipaddress import ip_address
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+
+ROOT = Path(__file__).resolve().parent
+DATA = Path(os.environ.get("MCN_DATA_DIR", ROOT / ".mcn-data")).expanduser().resolve()
+EXECUTION = DATA / "execution"
+BEACON = DATA / "beacon"
+JWT = DATA / "jwt.hex"
+PREPARATION = DATA / "bootstrap.json"
+PREPARATION_LOCK = DATA / ".prepare.lock"
+LOCAL_RPC = "http://127.0.0.1:8545"
+LOCAL_BEACON = "http://127.0.0.1:3500"
+IDENTITY = json.loads((ROOT / "network/identity.json").read_text())
+
+
+def client_binary(variable, name):
+    local = ROOT / "bin" / name
+    return os.environ.get(variable) or (str(local) if os.access(local, os.X_OK) else name)
+
+
+GETH = client_binary("MCN_GETH", "geth")
+PRYSM = client_binary("MCN_BEACON", "beacon-chain")
+
+
+def verify_bundle():
+    expected = {
+        "execution/bootnodes.txt", "execution/peers.toml", "network/config.yaml",
+        "network/genesis.json", "network/genesis.ssz", "network/identity.json",
+        "network/peers.json",
+    }
+    checked = set()
+    for line in (ROOT / "SHA256SUMS").read_text().splitlines():
+        digest, filename = line.split(maxsplit=1)
+        if filename not in expected or filename in checked:
+            raise ValueError(f"Unexpected checksum entry: {filename}")
+        if hashlib.sha256((ROOT / filename).read_bytes()).hexdigest() != digest:
+            raise ValueError(f"SHA-256 mismatch: {filename}")
+        checked.add(filename)
+    if checked != expected:
+        raise ValueError("Incomplete checksum manifest")
+
+    genesis = json.loads((ROOT / "network/genesis.json").read_text())
+    with (ROOT / "network/genesis.ssz").open("rb") as file:
+        header = file.read(40)
+    genesis_time, = struct.unpack_from("<Q", header)
+    if (
+        genesis["config"]["chainId"] != IDENTITY["chain_id"]
+        or int(genesis["timestamp"], 0) != genesis_time
+        or genesis_time != IDENTITY["genesis_time"]
+        or "0x" + header[8:].hex() != IDENTITY["genesis_validators_root"]
+    ):
+        raise ValueError("Genesis files disagree with network identity")
+
+
+def verify_version(binary, command, version):
+    if not shutil.which(binary):
+        raise ValueError(f"Executable not found: {binary}. See the client requirements in README.md.")
+    result = subprocess.check_output([binary, command], text=True, stderr=subprocess.STDOUT)
+    if not re.search(rf"(?<![0-9.]){re.escape(version)}(?![0-9.])", result):
+        raise ValueError(f"{binary} does not report version {version}")
+
+
+def check_clients():
+    verify_version(GETH, "version", IDENTITY["clients"]["geth"])
+    verify_version(PRYSM, "--version", IDENTITY["clients"]["prysm"])
+
+
+def check_jwt():
+    if JWT.is_symlink():
+        raise ValueError(f"Expected a regular JWT file at {JWT}")
+    info = JWT.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise ValueError(f"JWT must be a regular file with owner-only permissions: {JWT}")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", JWT.read_text().strip()):
+        raise ValueError(f"JWT must contain 32 hex-encoded bytes: {JWT}")
+
+
+def run_preparation_command(options):
+    # Keep the preparation lock until Geth exits, including on service stop.
+    with subprocess.Popen(options) as process:
+        interrupted = False
+
+        def stop(signum, _frame):
+            nonlocal interrupted
+            interrupted = True
+            process.send_signal(signum)
+
+        handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            code = process.wait()
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        if interrupted:
+            raise InterruptedError("Preparation interrupted; the saved target can be resumed")
+        if code:
+            raise subprocess.CalledProcessError(code, options)
+
+
+def initialize():
+    try:
+        fd = os.open(JWT, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w") as file:
+            file.write(secrets.token_hex(32) + "\n")
+    check_jwt()
+    run_preparation_command([
+        GETH, f"--datadir={EXECUTION}", "--state.scheme=path", "init",
+        str(ROOT / "network/genesis.json"),
+    ])
+    print(f"Initialized execution data in {EXECUTION}")
+
+
+def geth_options():
+    bootnodes = (ROOT / "execution/bootnodes.txt").read_text().strip()
+    options = [
+        GETH, f"--datadir={EXECUTION}", "--state.scheme=path", "--cache=512",
+        f"--networkid={IDENTITY['chain_id']}", "--syncmode=full",
+        f"--config={ROOT / 'execution/peers.toml'}", f"--bootnodes={bootnodes}",
+        "--port=30303", "--discovery.v4=true", "--engine.maxreorgdepth=32",
+        "--http", "--http.addr=127.0.0.1", "--http.port=8545", "--http.api=eth,net,web3",
+        "--http.vhosts=localhost,127.0.0.1", "--authrpc.addr=127.0.0.1",
+        "--authrpc.port=8551", "--authrpc.vhosts=localhost,127.0.0.1",
+        f"--authrpc.jwtsecret={JWT}",
+    ]
+    if public_ip := os.environ.get("MCN_PUBLIC_IP"):
+        options.append(f"--nat=extip:{ip_address(public_ip)}")
+    return options
+
+
+def beacon_options():
+    peers = json.loads((ROOT / "network/peers.json").read_text())
+    deposit = json.loads((ROOT / "network/genesis.json").read_text())["config"]["depositContractAddress"]
+    options = [
+        PRYSM, f"--datadir={BEACON}", f"--chain-config-file={ROOT / 'network/config.yaml'}",
+        f"--genesis-state={ROOT / 'network/genesis.ssz'}", f"--execution-endpoint=http://127.0.0.1:8551",
+        f"--jwt-secret={JWT}", f"--deposit-contract={deposit}", "--contract-deployment-block=0",
+        "--rpc-host=127.0.0.1", "--rpc-port=4000", "--http-host=127.0.0.1", "--http-port=3500",
+        "--monitoring-host=127.0.0.1", "--monitoring-port=8080", "--p2p-static-id",
+        "--p2p-tcp-port=13000", "--p2p-udp-port=12000", "--p2p-quic-port=13000",
+        "--min-sync-peers=2", "--sync-from=head", "--accept-terms-of-use",
+    ]
+    options += [f"--peer={peer}" for peer in peers["multiaddrs"]]
+    options += [f"--bootstrap-node={peer}" for peer in peers["enrs"]]
+    if public_ip := os.environ.get("MCN_PUBLIC_IP"):
+        options.append(f"--p2p-host-ip={ip_address(public_ip)}")
+    return options
+
+
+def run_client(options, *, beacon=False):
+    verify_bundle()
+    if not PREPARATION.is_file() or read_preparation()["phase"] != "ready":
+        raise ValueError("Run ./mcn-node prepare before starting either client")
+    check_local_data()
+    if beacon:
+        verify_version(PRYSM, "--version", IDENTITY["clients"]["prysm"])
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                verify_reference(LOCAL_RPC)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+    else:
+        verify_version(GETH, "version", IDENTITY["clients"]["geth"])
+    os.execvp(options[0], options)
+
+
+def read_json(url, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = Request(url, data, {"Content-Type": "application/json", "User-Agent": "mcn-network/1.0"})
+    with urlopen(req, timeout=10) as response:
+        return json.load(response)
+
+
+def rpc(url, method, *params, allow_missing_finalized=False):
+    response = read_json(url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    if "error" in response:
+        message = response["error"].get("message", "").lower()
+        if allow_missing_finalized and ("not found" in message or "unknown block" in message):
+            return None
+        raise ValueError(f"{method}: {response['error']}")
+    return response["result"]
+
+
+def verify_reference(url):
+    chain = int(rpc(url, "eth_chainId"), 16)
+    genesis = rpc(url, "eth_getBlockByNumber", "0x0", False)
+    if chain != IDENTITY["chain_id"] or genesis["hash"].lower() != IDENTITY["execution_genesis_hash"]:
+        raise ValueError("Execution RPC does not match the bundle")
+    return genesis["hash"]
+
+
+def check_local_data():
+    check_jwt()
+    if not (EXECUTION / "geth/chaindata").is_dir():
+        raise ValueError("Prepared execution database is missing")
+
+
+def read_preparation():
+    state = json.loads(PREPARATION.read_text())
+    if (
+        state["genesis"] != IDENTITY["execution_genesis_hash"]
+        or state["phase"] not in {"pending", "ready"}
+        or not re.fullmatch(r"0x[0-9a-f]{64}", state["hash"])
+        or int(state["height"], 16) <= 0
+    ):
+        raise ValueError("Invalid MCN bootstrap record")
+    return state
+
+
+def save_preparation(state):
+    temporary = PREPARATION.with_suffix(".tmp")
+    with temporary.open("w") as file:
+        json.dump(state, file)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary, PREPARATION)
+
+
+def execution_head_hash():
+    # Geth's LastBlock key stores the canonical execution head.
+    info = subprocess.check_output([
+        GETH, f"--datadir={EXECUTION}", "db", "get", "0x4c617374426c6f636b",
+    ], text=True, stderr=subprocess.STDOUT)
+    hashes = re.findall(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", info)
+    if len(hashes) != 1:
+        raise ValueError("Could not read the stored execution head hash")
+    return "0x" + hashes[0].lower()
+
+
+def canonical_hash(reference, height):
+    block = rpc(reference, "eth_getBlockByNumber", height, False)
+    if not block:
+        raise ValueError(f"Reference RPC has no canonical block at height {height}")
+    return block["hash"].lower()
+
+
+def prepare(reference):
+    verify_bundle()
+    check_clients()
+    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with PREPARATION_LOCK.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if PREPARATION.exists():
+            state = read_preparation()
+            if state["phase"] == "ready":
+                check_local_data()
+                if execution_head_hash() == state["genesis"]:
+                    raise ValueError("The prepared database is back at genesis. Use a new local data directory.")
+                print("Using existing execution database.")
+                return
+        else:
+            entries = {path.name for path in DATA.iterdir()}
+            if entries <= {PREPARATION_LOCK.name, PREPARATION.with_suffix(".tmp").name, ".launcher"}:
+                verify_reference(reference)
+                block = rpc(reference, "eth_getBlockByNumber", "finalized", False)
+                if not block or int(block["number"], 16) <= 0:
+                    raise ValueError("Reference RPC did not return a finalized block after genesis")
+                phase = "pending"
+            elif (EXECUTION / "geth/chaindata").is_dir():
+                # Adopt an existing database only when its non-genesis head is canonical on MCN.
+                check_local_data()
+                verify_reference(reference)
+                head = execution_head_hash()
+                block = rpc(reference, "eth_getBlockByHash", head, False)
+                if not block or int(block["number"], 16) <= 0 or block["hash"].lower() != head:
+                    raise ValueError("Existing execution database needs a verified non-genesis head")
+                phase = "ready"
+            else:
+                raise ValueError("Choose an empty data directory or an existing MCN execution database")
+            state = {
+                "genesis": IDENTITY["execution_genesis_hash"], "phase": phase,
+                "height": block["number"], "hash": block["hash"].lower(),
+            }
+            if not re.fullmatch(r"0x[0-9a-f]{64}", state["hash"]):
+                raise ValueError("Invalid target execution hash")
+            if canonical_hash(reference, state["height"]) != state["hash"]:
+                raise ValueError("Reference RPC does not confirm the execution hash at its reported height")
+            save_preparation(state)
+            if phase == "ready":
+                print("Using existing execution database.")
+                return
+
+        verify_reference(reference)
+        height, target = state["height"], state["hash"]
+        if canonical_hash(reference, height) != target:
+            raise ValueError("The saved bootstrap target no longer matches the reference")
+        initialize()
+        if execution_head_hash() != target:
+            print(f"Bootstrapping execution to finalized block {int(height, 16)} ({target})", flush=True)
+            run_preparation_command(geth_options() + [f"--synctarget={target}", "--exitwhensynced"])
+        if execution_head_hash() != target or canonical_hash(reference, height) != target:
+            raise ValueError("Execution head does not match the verified bootstrap target")
+        save_preparation({**state, "phase": "ready"})
+        print("Execution database ready.")
+
+
+def status():
+    synced = rpc(LOCAL_RPC, "eth_syncing")
+    finalized = rpc(LOCAL_RPC, "eth_getBlockByNumber", "finalized", False, allow_missing_finalized=True)
+    return {
+        "geth_head": int(rpc(LOCAL_RPC, "eth_blockNumber"), 16),
+        "geth_syncing": synced,
+        "geth_peers": int(rpc(LOCAL_RPC, "net_peerCount"), 16),
+        "geth_finalized": None if not finalized else {
+            "height": int(finalized["number"], 16), "hash": finalized["hash"],
+        },
+        "prysm": read_json(LOCAL_BEACON + "/eth/v1/node/syncing")["data"],
+        "prysm_peers": int(read_json(LOCAL_BEACON + "/eth/v1/node/peer_count")["data"]["connected"]),
+    }
+
+
+def wait_sync(args):
+    if args.timeout <= 0 or args.interval <= 0:
+        raise ValueError("Timeout and interval must be positive")
+    deadline = time.monotonic() + args.timeout
+    verify_reference(args.reference)
+    first_finalized = None
+    while time.monotonic() < deadline:
+        try:
+            local = status()
+            print(json.dumps(local, ensure_ascii=False), flush=True)
+            prysm = local["prysm"]
+            finalized = local["geth_finalized"]
+            if (
+                local["geth_syncing"] is False
+                and local["geth_peers"] > 0
+                and local["prysm_peers"] > 0
+                and prysm["is_syncing"] is False
+                and prysm["is_optimistic"] is False
+                and not prysm.get("el_offline")
+                and finalized
+            ):
+                verify_reference(LOCAL_RPC)
+                genesis = read_json(LOCAL_BEACON + "/eth/v1/beacon/genesis")["data"]
+                if (
+                    genesis["genesis_validators_root"] != IDENTITY["genesis_validators_root"]
+                    or int(genesis["genesis_time"]) != IDENTITY["genesis_time"]
+                    or genesis["genesis_fork_version"] != IDENTITY["genesis_fork_version"]
+                ):
+                    raise ValueError("Local Beacon genesis does not match the bundle")
+                remote = rpc(args.reference, "eth_getBlockByNumber", "finalized", False)
+                if remote and int(remote["number"], 16) >= finalized["height"]:
+                    same_height = rpc(args.reference, "eth_getBlockByNumber", hex(finalized["height"]), False)
+                    if not same_height or same_height["hash"] != finalized["hash"]:
+                        raise ValueError("Finalized execution block hash mismatch")
+                    if first_finalized is None:
+                        first_finalized = finalized["height"]
+                    elif finalized["height"] > first_finalized:
+                        print("Node ready.")
+                        return
+        except (OSError, KeyError, TypeError) as error:
+            print(f"Waiting for clients: {error}", file=sys.stderr, flush=True)
+        time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
+    raise ValueError("Sync acceptance criteria were not met within the timeout")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MCN Mainnet full node")
+    commands = parser.add_subparsers(dest="command", required=True)
+    verify = commands.add_parser("verify")
+    verify.add_argument("--clients", action="store_true", help="Require the configured Geth and Prysm versions")
+    verify.add_argument("--reference", action="store_true", help="Also query official MCN execution RPC")
+    for name in ("geth", "beacon", "status"):
+        commands.add_parser(name)
+    seed = commands.add_parser(
+        "prepare", aliases=["bootstrap", "init"], help="Prepare or resume the execution database",
+    )
+    seed.add_argument("--reference", default=IDENTITY["reference_rpc"])
+    wait = commands.add_parser("wait-sync")
+    wait.add_argument("--reference", default=IDENTITY["reference_rpc"])
+    wait.add_argument("--timeout", type=float, default=3600)
+    wait.add_argument("--interval", type=float, default=20)
+    args = parser.parse_args()
+
+    try:
+        if args.command == "verify":
+            verify_bundle()
+            if args.clients:
+                check_clients()
+            if args.reference:
+                print(f"Official RPC genesis: {verify_reference(IDENTITY['reference_rpc'])}")
+        elif args.command == "geth":
+            run_client(geth_options())
+        elif args.command == "beacon":
+            run_client(beacon_options(), beacon=True)
+        elif args.command == "status":
+            print(json.dumps(status(), indent=2))
+        elif args.command in ("prepare", "bootstrap", "init"):
+            prepare(args.reference)
+        elif args.command == "wait-sync":
+            wait_sync(args)
+    except (OSError, ValueError, KeyError, TypeError, struct.error, subprocess.CalledProcessError) as error:
+        print(f"MCN: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

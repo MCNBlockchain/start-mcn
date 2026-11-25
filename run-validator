@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Run the separately installed Prysm Validator with this network config."""
+import argparse
+import os
+from pathlib import Path
+import re
+import runpy
+import stat
+import subprocess
+
+ROOT = Path(__file__).resolve().parent
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prysm Validator для MCN Mainnet")
+    parser.add_argument("--fee-recipient", required=True, help="Ваш адрес получения комиссий MCN")
+    args = parser.parse_args()
+    try:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", args.fee_recipient) or int(args.fee_recipient[2:], 16) == 0:
+            raise ValueError("Укажите ненулевой адрес MCN длиной 42 символа.")
+        node = runpy.run_path(str(ROOT / "mcn-node"), run_name="mcn_config")
+        node["verify_bundle"]()
+        binary = node["client_binary"]("MCN_VALIDATOR", "validator")
+        node["verify_version"](binary, "--version", node["IDENTITY"]["clients"]["prysm"])
+        folder = Path.home() / "mcn-validator"
+        wallet, password = folder / "wallet", folder / "wallet-password.txt"
+        if not wallet.is_dir():
+            raise ValueError("Импортируйте keystore по инструкции VALIDATORS.md.")
+        mode = password.stat().st_mode
+        if password.is_symlink() or not stat.S_ISREG(mode) or mode & 0o077:
+            raise ValueError("Файл пароля должен быть обычным файлом с правами 600.")
+        subprocess.run([str(ROOT / "start"), "wait"], check=True)
+        os.umask(0o077)
+        command = [
+            binary, f"--datadir={folder / 'data'}", f"--wallet-dir={wallet}",
+            f"--wallet-password-file={password}", f"--chain-config-file={ROOT / 'network/config.yaml'}",
+            "--beacon-rpc-provider=127.0.0.1:4000",
+            f"--suggested-fee-recipient={args.fee_recipient}",
+            "--suggested-gas-limit=60000000", "--monitoring-host=127.0.0.1",
+            "--monitoring-port=8081", "--accept-terms-of-use",
+        ]
+        os.execvp(binary, command)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"MCN: {error}\n")

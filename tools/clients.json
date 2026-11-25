@@ -1,0 +1,30 @@
+{
+  "amd64": {
+    "geth": {
+      "url": "https://gethstore.blob.core.windows.net/builds/geth-linux-amd64-1.17.10-1df30b18.tar.gz",
+      "sha256": "e016aca8cc391c8d5d14dc17c9af589488d99c37ed71d892213c80757935ba64"
+    },
+    "beacon-chain": {
+      "url": "https://github.com/OffchainLabs/prysm/releases/download/v7.3.1/beacon-chain-v7.3.1-linux-amd64",
+      "sha256": "4e740bd2eabc98863607c649062f2e8720d4e12ccab28fc59ec6e84cbc90da3e"
+    },
+    "validator": {
+      "url": "https://github.com/OffchainLabs/prysm/releases/download/v7.3.1/validator-v7.3.1-linux-amd64",
+      "sha256": "1be08125b3ea8ecf8e59ebfa48dca77745a9c3a45b0fb390c5122a25e9adc39b"
+    }
+  },
+  "arm64": {
+    "geth": {
+      "url": "https://gethstore.blob.core.windows.net/builds/geth-linux-arm64-1.17.10-1df30b18.tar.gz",
+      "sha256": "79380151f998248e48e22773d7afb032ac07503e055d81e44f4f0125008e78b8"
+    },
+    "beacon-chain": {
+      "url": "https://github.com/OffchainLabs/prysm/releases/download/v7.3.1/beacon-chain-v7.3.1-linux-arm64",
+      "sha256": "b8afffb44dee8b5d04719ec0c9733782895110618db6c45c9ee351df30b678ed"
+    },
+    "validator": {
+      "url": "https://github.com/OffchainLabs/prysm/releases/download/v7.3.1/validator-v7.3.1-linux-arm64",
+      "sha256": "43690adfd642b65ddbc5326d4643ff3a5a43531b84ff9220f525f63f19d1f3b2"
+    }
+  }
+}

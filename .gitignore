@@ -1,0 +1,8 @@
+/.mcn-data/
+/bin/
+/node.env
+/*.log
+__pycache__/
+/dist/
+/.tools/
+/.mcn-validator/
